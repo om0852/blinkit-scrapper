@@ -61,23 +61,16 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
     async function setDeliveryLocation(page, log, location, pincode) {
       try {
         log.info('📍 Setting delivery location...');
-        
         await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-        
-        const locationBarSelector = 'div[class*="LocationBar"]';
-        const locationInputSelector = 'input[name="select-locality"], input[placeholder*="delivery location"]';
-        
-        try {
-            await page.waitForSelector(`${locationBarSelector}, ${locationInputSelector}`, { timeout: 5000 });
-        } catch(e) {
-            log.info('Location elements not immediately found, continuing...');
-        }
+        await page.waitForTimeout(2000);
 
-        const locationBarExists = await page.locator(locationBarSelector).count() > 0;
+        const locationBarExists = await page.locator('div[class*="LocationBar"]').count() > 0;
         if (locationBarExists) {
-          const locationBar = page.locator(locationBarSelector).first();
+          const locationBar = page.locator('div[class*="LocationBar"]').first();
           await locationBar.click({ timeout: 5000 }).catch(() => {});
-          await page.waitForSelector(locationInputSelector, { timeout: 3000 }).catch(() => {});
+          await page.waitForTimeout(1500);
+        } else {
+          log.info('Location bar not found, looking for modal...');
         }
 
         const locationInputSelectors = [
@@ -104,14 +97,11 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
 
         const searchText = pincode || location || 'Pune 411001';
         await locationInput.click({ timeout: 5000 }).catch(() => {});
-        await locationInput.fill(searchText).catch(() => {}); 
-        
-        const suggestionSelector = 'div.LocationSearchList__LocationListContainer-sc-93rfr7-0, div[class*="LocationSelector"], div[role="option"]';
-        try {
-            await page.waitForSelector(suggestionSelector, { timeout: 5000 });
-        } catch(e) {
-            log.warning('Suggestions did not appear');
-        }
+        await page.waitForTimeout(300);
+        await locationInput.fill('').catch(() => {});
+        await page.waitForTimeout(300);
+        await locationInput.type(searchText, { delay: 80 }).catch(() => {});
+        await page.waitForTimeout(1500);
 
         const suggestionSelectors = [
           'div.LocationSearchList__LocationListContainer-sc-93rfr7-0',
@@ -127,6 +117,7 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
             try {
               await firstSuggestion.click({ timeout: 5000 });
               log.info(`✓ Clicked location suggestion`);
+              await page.waitForTimeout(2000);
               suggestionFound = true;
               break;
             } catch (e) {
@@ -137,10 +128,9 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
 
         if (!suggestionFound) {
           await locationInput.press('Enter', { timeout: 5000 }).catch(() => {});
+          await page.waitForTimeout(2000);
         }
-        
-        await page.waitForTimeout(1000); 
-        
+
         log.info('✅ Location set successfully');
         return true;
       } catch (error) {
@@ -149,42 +139,55 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
       }
     }
 
-    // IMPROVED INTELLIGENT SCROLL FUNCTION
+    // FIXED: Scroll the actual product container, not window
     async function autoScroll(page, log, maxProducts = 100) {
       try {
         log.info(`🔄 Starting intelligent scroll (target: ${maxProducts} products)...`);
         
+        // Try multiple container selectors
+        const containerSelectors = [
+          '#plpContainer',
+          'div[id="plpContainer"]',
+          'div.BffPlpFeedContainer__ItemsContainer-sc-12wcdtn-2',
+          'div[style*="overflow-y: scroll"]'
+        ];
+        
+        let containerSelector = null;
+        for (const selector of containerSelectors) {
+          const exists = await page.locator(selector).count() > 0;
+          if (exists) {
+            containerSelector = selector;
+            log.info(`✓ Found scrollable container: ${selector}`);
+            break;
+          }
+        }
+        
+        if (!containerSelector) {
+          log.warning('⚠️ Could not find scrollable container, using window scroll');
+          containerSelector = null; // Will use window scroll as fallback
+        }
+        
         let previousCount = 0;
         let stableCount = 0;
         let scrollAttempts = 0;
-        const maxScrollAttempts = 50; 
-        const stableThreshold = 3; 
+        const maxScrollAttempts = 50;
+        const stableThreshold = 3;
         
-        // Use a broader selector for counting to support both search and category pages
-        const countSelector = 'div[data-test-id="product-card"], div[class*="Product__ProductContainer"], div[id][role="button"]';
-
-        // Check if we have a specific scrollable container (common in category pages)
-        const scrollContainerSelector = '#plpContainer, div[class*="BffPlpFeedContainer__ItemsContainer"]';
-        const hasScrollContainer = await page.locator(scrollContainerSelector).count() > 0;
-        
-        if (hasScrollContainer) {
-            log.info(`✓ Found specific scroll container: ${scrollContainerSelector}`);
-        } else {
-            log.info('Using window scroll');
-        }
-
         while (scrollAttempts < maxScrollAttempts) {
-          const currentCount = await page.evaluate((sel) => {
-            return document.querySelectorAll(sel).length;
-          }, countSelector);
+          // Get current product count
+          const currentCount = await page.evaluate(() => {
+            return document.querySelectorAll('div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col').length;
+          });
           
           log.info(`📊 Scroll ${scrollAttempts + 1}: Found ${currentCount} products`);
           
+          // Check if we've reached target
           if (currentCount >= maxProducts) {
             log.info(`✅ Reached target of ${maxProducts} products`);
             break;
           }
           
+          // Check if count hasn't changed
           if (currentCount === previousCount) {
             stableCount++;
             if (stableCount >= stableThreshold) {
@@ -192,58 +195,85 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
               break;
             }
           } else {
-            stableCount = 0; 
+            stableCount = 0;
           }
           
           previousCount = currentCount;
           
-          if (hasScrollContainer) {
-              // Scroll the container
-              await page.evaluate((selector) => {
-                  const container = document.querySelector(selector);
-                  if (container) {
-                      container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
-                  }
-              }, scrollContainerSelector);
+          // FIXED: Scroll the container, not window
+          if (containerSelector) {
+            await page.evaluate((selector) => {
+              const container = document.querySelector(selector);
+              if (container) {
+                container.scrollBy({
+                  top: container.clientHeight * 0.8,
+                  behavior: 'smooth'
+                });
+              }
+            }, containerSelector);
           } else {
-              // Scroll the window
-              await page.evaluate(() => {
-                window.scrollTo(0, document.body.scrollHeight);
+            // Fallback to window scroll
+            await page.evaluate(() => {
+              window.scrollBy({
+                top: window.innerHeight * 0.8,
+                behavior: 'smooth'
               });
+            });
           }
           
-          await page.waitForTimeout(1500); 
+          // Wait for new content to load
+          await page.waitForTimeout(2000);
           
-          // Small scroll up to trigger observers
-          if (hasScrollContainer) {
-               await page.evaluate((selector) => {
-                  const container = document.querySelector(selector);
-                  if (container) {
-                      container.scrollBy({ top: -200, behavior: 'smooth' });
-                  }
-              }, scrollContainerSelector);
-          } else {
-              await page.evaluate(() => {
-                window.scrollBy(0, -200);
-              });
-          }
-          await page.waitForTimeout(500);
-
+          // Additional wait for products
           try {
-             await page.waitForFunction((args) => {
-                 const count = document.querySelectorAll(args.sel).length;
-                 return count > args.prev;
-             }, { sel: countSelector, prev: previousCount }, { timeout: 2000 });
-          } catch(e) {
-             // Timeout meant no new items loaded quickly
+            await page.waitForSelector('div[id][role="button"].tw-relative', {
+              state: 'attached',
+              timeout: 3000
+            });
+          } catch (e) {
+            // No new products
           }
           
           scrollAttempts++;
         }
         
-        const finalCount = await page.evaluate((sel) => {
-          return document.querySelectorAll(sel).length;
-        }, countSelector);
+        // Final scroll to bottom
+        if (containerSelector) {
+          await page.evaluate((selector) => {
+            const container = document.querySelector(selector);
+            if (container) {
+              container.scrollTo({
+                top: container.scrollHeight,
+                behavior: 'smooth'
+              });
+            }
+          }, containerSelector);
+        } else {
+          await page.evaluate(() => {
+            window.scrollTo({
+              top: document.body.scrollHeight,
+              behavior: 'smooth'
+            });
+          });
+        }
+        await page.waitForTimeout(2000);
+        
+        // Scroll back to top
+        if (containerSelector) {
+          await page.evaluate((selector) => {
+            const container = document.querySelector(selector);
+            if (container) {
+              container.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+          }, containerSelector);
+        } else {
+          await page.evaluate(() => window.scrollTo(0, 0));
+        }
+        await page.waitForTimeout(500);
+        
+        const finalCount = await page.evaluate(() => {
+          return document.querySelectorAll('div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col').length;
+        });
         
         log.info(`✅ Scroll complete: ${finalCount} total products loaded`);
         
@@ -261,7 +291,8 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
         const pageInfo = await page.evaluate(() => ({
           url: window.location.href,
           title: document.title,
-          productCount: document.querySelectorAll('div[data-test-id="product-card"], div[class*="Product__ProductContainer"], div[id][role="button"]').length
+          productCount: document.querySelectorAll('div[id][role="button"].tw-relative').length,
+          containerExists: !!document.querySelector('#plpContainer')
         }));
 
         log.info(`Page state: ${JSON.stringify(pageInfo)}`);
@@ -271,12 +302,12 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
     }
 
     async function waitForSearchResults(page, log) {
-      // Broader selector for results
-      const mainSelector = 'div[data-test-id="product-card"], div[class*="Product__ProductContainer"], div[id][role="button"]';
+      const mainSelector = 'div[id][role="button"].tw-relative';
       try {
         await page.waitForSelector(mainSelector, { timeout: 10000 });
         const count = await page.locator(mainSelector).count();
         if (count > 0) {
+          await page.waitForTimeout(800);
           return true;
         }
       } catch (error) {
@@ -285,7 +316,7 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
       return false;
     }
 
-    // CORRECTED EXTRACTION FUNCTION BASED ON HTML
+    // Product extraction function
     async function extractSearchProducts(page, log, globalDeliveryTime) {
       try {
         log.info('🔍 Starting product extraction...');
@@ -342,39 +373,22 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
           log.warning(`Could not read PRELOADED_STATE: ${e.message}`);
         }
 
-        // DOM extraction with CORRECT selectors based on HTML
+        // DOM extraction
         const products = await page.evaluate((globalDeliveryTime) => {
           const results = [];
-
-          // Use the SAME combined selector as autoScroll to ensure we get everything
-          const combinedSelector = 'div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col, div[data-test-id="product-card"], div[class*="Product__ProductContainer"], a[href*="/prn/"]';
-          
-          const productCards = Array.from(document.querySelectorAll(combinedSelector));
-
-          // Use a Set to avoid duplicates if selectors overlap
-          const processedElements = new Set();
+          const productCards = Array.from(document.querySelectorAll('div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col'));
 
           productCards.forEach((card) => {
-            if (processedElements.has(card)) return;
-            processedElements.add(card);
-
             try {
-              // Product ID from the card's id attribute
               const productId = card.id || null;
 
-              // Product Name - Try multiple selectors
-              let nameEl = card.querySelector('div.tw-text-300.tw-font-semibold.tw-line-clamp-2');
-              if (!nameEl) nameEl = card.querySelector('div[class*="Product__ProductName"]');
-              if (!nameEl) nameEl = card.querySelector('div[class*="title"]');
+              const nameEl = card.querySelector('div.tw-text-300.tw-font-semibold.tw-line-clamp-2');
               const productName = nameEl ? nameEl.textContent.trim() : null;
 
-              // Product Image
               const imgEl = card.querySelector('img');
               const productImage = imgEl ? (imgEl.src || imgEl.getAttribute('src')) : null;
 
-              // Current Price - Try multiple selectors
-              let priceEl = card.querySelector('div.tw-text-200.tw-font-semibold');
-              if (!priceEl) priceEl = card.querySelector('div[class*="Product__Price"]');
+              const priceEl = card.querySelector('div.tw-text-200.tw-font-semibold');
               let currentPrice = null;
               if (priceEl) {
                 const priceText = priceEl.textContent.trim();
@@ -384,7 +398,6 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
                 }
               }
 
-              // Original Price (strikethrough price)
               const originalPriceEl = card.querySelector('div.tw-text-200.tw-font-regular.tw-line-through');
               let originalPrice = null;
               if (originalPriceEl) {
@@ -395,25 +408,20 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
                 }
               }
 
-              // Product Weight/Size
               const weightEl = card.querySelector('div.tw-text-200.tw-font-medium.tw-line-clamp-1');
               const productWeight = weightEl ? weightEl.textContent.trim() : null;
 
-              // Delivery Time
               const deliveryEl = card.querySelector('div.tw-text-050.tw-font-bold.tw-uppercase');
               const deliveryTime = globalDeliveryTime || (deliveryEl ? deliveryEl.textContent.trim() : null);
 
-              // Out of Stock status
               const outOfStockEl = card.querySelector('div.tw-absolute.tw-bottom-1\\/2.tw-right-1\\/2');
               const isOutOfStock = outOfStockEl && outOfStockEl.textContent.includes('Out of Stock');
 
-              // Discount calculation
               let discountPercentage = null;
               if (currentPrice && originalPrice && originalPrice > currentPrice) {
                 discountPercentage = Math.round(((originalPrice - currentPrice) / originalPrice) * 100);
               }
 
-              // Only add if we have essential data
               if (productName || currentPrice || productImage) {
                 results.push({
                   productId: productId || `blinkit-${results.length}`,
@@ -496,9 +504,11 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
           log.info(`🔍 Processing: ${url}`);
 
           await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
+          await page.waitForTimeout(3000);
 
           if ((pincode || deliveryLocation) && isFirstRequest) {
             await setDeliveryLocation(page, log, deliveryLocation, pincode);
+            await page.waitForTimeout(2000);
           }
 
           if (debugMode) {
@@ -510,7 +520,7 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
             const closeButtons = page.locator('button:has-text("Close"), button:has-text("×"), [aria-label="Close"]');
             if (await closeButtons.count() > 0) {
               await closeButtons.first().click({ timeout: 2000 });
-              await page.waitForTimeout(500); 
+              await page.waitForTimeout(800);
             }
           } catch (e) {
             // No popup
@@ -523,7 +533,7 @@ import { PlaywrightCrawler, Dataset } from 'crawlee';
             return;
           }
 
-          // USE THE NEW INTELLIGENT SCROLL FUNCTION
+          // Scroll the product container
           await autoScroll(page, log, maxProductsPerSearch);
 
           // Extract global delivery time
