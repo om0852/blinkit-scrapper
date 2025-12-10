@@ -12,9 +12,10 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "apify": "^3.5.2",
+  "apify": "^3.5.2",
     "crawlee": "^3.15.3",
     "nodemon": "^3.1.11",
-    "playwright": "^1.30.0"
+    "playwright": "^1.30.0",
+    "user-agents": "^1.1.669"
   }
 }

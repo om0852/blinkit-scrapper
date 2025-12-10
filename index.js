@@ -1,638 +1,979 @@
 import { Actor } from 'apify';
 import { PlaywrightCrawler, Dataset } from 'crawlee';
 
-// Wrap everything in async IIFE with proper exit handling
-(async () => {
-  try {
-    await Actor.init();
+await Actor.init();
 
-    const input = await Actor.getInput();
-    const {
-      searchUrls = [],
-      searchQueries = [],
-      deliveryLocation = null,
-      pincode = null,
-      maxProductsPerSearch = 100,
-      proxyConfiguration = { useApifyProxy: false },
-      maxRequestRetries = 3,
-      maxConcurrency = 2,
-      navigationTimeout = 60000,
-      headless = true,
-      screenshotOnError = true,
-      debugMode = false
-    } = input || {};
+const input = await Actor.getInput();
 
-    const USER_AGENTS = [
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15',
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-    ];
+const {
+    searchUrls = [],
+    searchQueries = [],
+    maxProductsPerSearch = 100,
+    proxyConfiguration = { useApifyProxy: false },
+    maxRequestRetries = 3,
+    navigationTimeout = 90000,
+    headless = false,
+    screenshotOnError = true,
+    debugMode = true,
+    scrollCount = 5
+} = input;
 
-    function pickRandom(arr) {
-      return arr[Math.floor(Math.random() * arr.length)];
-    }
+// Generate search URLs from queries if provided
+const allSearchUrls = [
+    ...searchUrls,
+    ...searchQueries.map(query => `https://blinkit.com/s/?q=${encodeURIComponent(query)}`)
+];
 
-    function parseProxyUrl(proxyUrl) {
-      try {
-        const u = new URL(proxyUrl);
-        const server = `${u.protocol}//${u.hostname}${u.port ? `:${u.port}` : ''}`;
-        const proxy = { server };
-        if (u.username) proxy.username = decodeURIComponent(u.username);
-        if (u.password) proxy.password = decodeURIComponent(u.password);
-        return proxy;
-      } catch (e) {
-        return null;
-      }
-    }
+const proxyConfig = proxyConfiguration.useApifyProxy
+    ? await Actor.createProxyConfiguration(proxyConfiguration)
+    : undefined;
 
-    const allSearchUrls = [
-      ...searchUrls,
-      ...searchQueries.map(query => `https://blinkit.com/s/?q=${encodeURIComponent(query)}`)
-    ];
+// Auto-scroll to load lazy products
+async function autoScroll(page, log, scrollCount = 5, scrollContainerSelector = null) {
+    try {
+        log.info(`Starting auto-scroll (${scrollCount} iterations) for ${scrollContainerSelector || 'window'}...`);
 
-    const proxyConfig = proxyConfiguration?.useApifyProxy
-      ? await Actor.createProxyConfiguration(proxyConfiguration)
-      : undefined;
+        for (let i = 0; i < scrollCount; i++) {
+            if (scrollContainerSelector) {
+                const scrolled = await page.evaluate((selector) => {
+                    const container = document.querySelector(selector);
+                    if (container) {
+                        container.scrollTop += container.clientHeight;
+                        return true;
+                    }
+                    return false;
+                }, scrollContainerSelector);
 
-    const customProxyUrl = proxyConfiguration?.customProxyUrl || proxyConfiguration?.proxyUrl || proxyConfiguration?.proxy;
-    const launchProxy = customProxyUrl ? parseProxyUrl(customProxyUrl) : null;
-
-    // Optimized location setter
-    async function setDeliveryLocation(page, log, location, pincode) {
-      try {
-        log.info('📍 Setting delivery location...');
-        await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-        await page.waitForTimeout(2000);
-
-        const locationBarExists = await page.locator('div[class*="LocationBar"]').count() > 0;
-        if (locationBarExists) {
-          const locationBar = page.locator('div[class*="LocationBar"]').first();
-          await locationBar.click({ timeout: 5000 }).catch(() => {});
-          await page.waitForTimeout(1500);
-        } else {
-          log.info('Location bar not found, looking for modal...');
-        }
-
-        const locationInputSelectors = [
-          'input.LocationSearchBox__InputSelect-sc-1k8u6a6-0',
-          'input[placeholder*="search delivery location"]',
-          'input[placeholder*="Search delivery location"]',
-          'input[name="select-locality"]',
-          'input[type="text"][placeholder*="location"]'
-        ];
-
-        let locationInput = null;
-        for (const selector of locationInputSelectors) {
-          if (await page.locator(selector).count() > 0) {
-            locationInput = page.locator(selector).first();
-            log.info(`✓ Found location input: ${selector}`);
-            break;
-          }
-        }
-
-        if (!locationInput) {
-          log.warning('⚠️ Location input not found');
-          return false;
-        }
-
-        const searchText = pincode || location || 'Pune 411001';
-        await locationInput.click({ timeout: 5000 }).catch(() => {});
-        await page.waitForTimeout(300);
-        await locationInput.fill('').catch(() => {});
-        await page.waitForTimeout(300);
-        await locationInput.type(searchText, { delay: 80 }).catch(() => {});
-        await page.waitForTimeout(1500);
-
-        const suggestionSelectors = [
-          'div.LocationSearchList__LocationListContainer-sc-93rfr7-0',
-          'div[class*="LocationSelector"]',
-          'div[role="option"]',
-          'li[role="option"]'
-        ];
-
-        let suggestionFound = false;
-        for (const selector of suggestionSelectors) {
-          if (await page.locator(selector).count() > 0) {
-            const firstSuggestion = page.locator(selector).first();
-            try {
-              await firstSuggestion.click({ timeout: 5000 });
-              log.info(`✓ Clicked location suggestion`);
-              await page.waitForTimeout(2000);
-              suggestionFound = true;
-              break;
-            } catch (e) {
-              continue;
-            }
-          }
-        }
-
-        if (!suggestionFound) {
-          await locationInput.press('Enter', { timeout: 5000 }).catch(() => {});
-          await page.waitForTimeout(2000);
-        }
-
-        log.info('✅ Location set successfully');
-        return true;
-      } catch (error) {
-        log.error(`Error setting location: ${error.message}`);
-        return false;
-      }
-    }
-
-    // FIXED: Scroll the actual product container, not window
-    async function autoScroll(page, log, maxProducts = 100) {
-      try {
-        log.info(`🔄 Starting intelligent scroll (target: ${maxProducts} products)...`);
-        
-        // Try multiple container selectors
-        const containerSelectors = [
-          '#plpContainer',
-          'div[id="plpContainer"]',
-          'div.BffPlpFeedContainer__ItemsContainer-sc-12wcdtn-2',
-          'div[style*="overflow-y: scroll"]'
-        ];
-        
-        let containerSelector = null;
-        for (const selector of containerSelectors) {
-          const exists = await page.locator(selector).count() > 0;
-          if (exists) {
-            containerSelector = selector;
-            log.info(`✓ Found scrollable container: ${selector}`);
-            break;
-          }
-        }
-        
-        if (!containerSelector) {
-          log.warning('⚠️ Could not find scrollable container, using window scroll');
-          containerSelector = null; // Will use window scroll as fallback
-        }
-        
-        let previousCount = 0;
-        let stableCount = 0;
-        let scrollAttempts = 0;
-        const maxScrollAttempts = 50;
-        const stableThreshold = 3;
-        
-        while (scrollAttempts < maxScrollAttempts) {
-          // Get current product count
-          const currentCount = await page.evaluate(() => {
-            return document.querySelectorAll('div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col').length;
-          });
-          
-          log.info(`📊 Scroll ${scrollAttempts + 1}: Found ${currentCount} products`);
-          
-          // Check if we've reached target
-          if (currentCount >= maxProducts) {
-            log.info(`✅ Reached target of ${maxProducts} products`);
-            break;
-          }
-          
-          // Check if count hasn't changed
-          if (currentCount === previousCount) {
-            stableCount++;
-            if (stableCount >= stableThreshold) {
-              log.info(`⚠️ Product count stable at ${currentCount} - likely reached end`);
-              break;
-            }
-          } else {
-            stableCount = 0;
-          }
-          
-          previousCount = currentCount;
-          
-          // FIXED: Scroll the container, not window
-          if (containerSelector) {
-            await page.evaluate((selector) => {
-              const container = document.querySelector(selector);
-              if (container) {
-                container.scrollBy({
-                  top: container.clientHeight * 0.8,
-                  behavior: 'smooth'
+                if (!scrolled) {
+                    // Fallback to window scroll if container not found
+                    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+                }
+            } else {
+                await page.evaluate(() => {
+                    window.scrollBy(0, window.innerHeight);
                 });
-              }
-            }, containerSelector);
-          } else {
-            // Fallback to window scroll
-            await page.evaluate(() => {
-              window.scrollBy({
-                top: window.innerHeight * 0.8,
-                behavior: 'smooth'
-              });
-            });
-          }
-          
-          // Wait for new content to load
-          await page.waitForTimeout(2000);
-          
-          // Additional wait for products
-          try {
-            await page.waitForSelector('div[id][role="button"].tw-relative', {
-              state: 'attached',
-              timeout: 3000
-            });
-          } catch (e) {
-            // No new products
-          }
-          
-          scrollAttempts++;
-        }
-        
-        // Final scroll to bottom
-        if (containerSelector) {
-          await page.evaluate((selector) => {
-            const container = document.querySelector(selector);
-            if (container) {
-              container.scrollTo({
-                top: container.scrollHeight,
-                behavior: 'smooth'
-              });
             }
-          }, containerSelector);
-        } else {
-          await page.evaluate(() => {
-            window.scrollTo({
-              top: document.body.scrollHeight,
-              behavior: 'smooth'
-            });
-          });
+
+            log.info(`Scroll ${i + 1}/${scrollCount}`);
+            await page.waitForTimeout(1500);
         }
-        await page.waitForTimeout(2000);
-        
+
         // Scroll back to top
-        if (containerSelector) {
-          await page.evaluate((selector) => {
-            const container = document.querySelector(selector);
-            if (container) {
-              container.scrollTo({ top: 0, behavior: 'smooth' });
-            }
-          }, containerSelector);
-        } else {
-          await page.evaluate(() => window.scrollTo(0, 0));
-        }
-        await page.waitForTimeout(500);
-        
-        const finalCount = await page.evaluate(() => {
-          return document.querySelectorAll('div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col').length;
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await page.waitForTimeout(1000);
+
+        log.info('Auto-scroll completed');
+    } catch (error) {
+        log.warning(`Auto-scroll failed: ${error.message}`);
+    }
+}
+
+// Debug page state
+async function debugPageState(page, log, label = 'debug') {
+    try {
+        const screenshot = await page.screenshot({ fullPage: true });
+        await Actor.setValue(`${label}-screenshot-${Date.now()}.png`, screenshot, { contentType: 'image/png' });
+
+        const html = await page.content();
+        await Actor.setValue(`${label}-html-${Date.now()}.html`, html, { contentType: 'text/html' });
+
+        const pageInfo = await page.evaluate(() => {
+            return {
+                url: window.location.href,
+                title: document.title,
+                elementCounts: {
+                    productCardsById: document.querySelectorAll('div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col').length,
+                    productTitles: document.querySelectorAll('div.tw-text-300.tw-font-semibold.tw-line-clamp-2').length,
+                    priceElements: document.querySelectorAll('div.tw-text-200.tw-font-semibold').length,
+                    weightElements: document.querySelectorAll('div.tw-text-200.tw-font-medium.tw-line-clamp-1').length,
+                    addButtons: Array.from(document.querySelectorAll('div[role="button"]')).filter(el => (el.textContent || '').includes('ADD')).length,
+                    images: document.querySelectorAll('img').length
+                }
+            };
         });
-        
-        log.info(`✅ Scroll complete: ${finalCount} total products loaded`);
-        
-      } catch (error) {
-        log.warning(`Auto-scroll error: ${error.message}`);
-      }
-    }
 
-    async function debugPageState(page, log, label = 'debug') {
-      if (!debugMode) return;
-      try {
-        const screenshot = await page.screenshot({ fullPage: false });
-        await Actor.setValue(`${label}-${Date.now()}.png`, screenshot, { contentType: 'image/png' });
-
-        const pageInfo = await page.evaluate(() => ({
-          url: window.location.href,
-          title: document.title,
-          productCount: document.querySelectorAll('div[id][role="button"].tw-relative').length,
-          containerExists: !!document.querySelector('#plpContainer')
-        }));
-
-        log.info(`Page state: ${JSON.stringify(pageInfo)}`);
-      } catch (error) {
+        log.info(`Page state: ${JSON.stringify(pageInfo, null, 2)}`);
+        return pageInfo;
+    } catch (error) {
         log.error(`Debug failed: ${error.message}`);
-      }
     }
+}
 
-    async function waitForSearchResults(page, log) {
-      const mainSelector = 'div[id][role="button"].tw-relative';
-      try {
-        await page.waitForSelector(mainSelector, { timeout: 10000 });
-        const count = await page.locator(mainSelector).count();
-        if (count > 0) {
-          await page.waitForTimeout(800);
-          return true;
-        }
-      } catch (error) {
-        log.warning(`No search results found: ${error.message}`);
-      }
-      return false;
-    }
+// Wait for search results to load
+async function waitForSearchResults(page, log) {
+    const selectors = [
+        'div[id][role="button"].tw-relative',
+        'div.tw-text-300.tw-font-semibold.tw-line-clamp-2',
+        'div.tw-text-200.tw-font-semibold',
+        'img[src*="cdn.grofers.com"]'
+    ];
 
-    // Product extraction function
-    async function extractSearchProducts(page, log, globalDeliveryTime) {
-      try {
-        log.info('🔍 Starting product extraction...');
+    log.info('Waiting for search results to load...');
 
-        // First try preloaded state
+    for (const selector of selectors) {
         try {
-          const preloaded = await page.evaluate(() => {
+            await page.waitForSelector(selector, { timeout: 15000 });
+            const count = await page.locator(selector).count();
+            log.info(`✓ Found ${count} elements matching: ${selector}`);
+
+            if (count > 0) {
+                await page.waitForTimeout(2000);
+                return true;
+            }
+        } catch (error) {
+            log.warning(`Selector ${selector} not found: ${error.message}`);
+        }
+    }
+
+    log.warning('No search result selectors found');
+    return false;
+}
+
+// Set location based on pincode
+async function setLocation(page, log, pincode) {
+    try {
+        log.info(`📍 Setting location to pincode: ${pincode}`);
+
+        // Wait for page to be ready
+        await page.waitForTimeout(2000);
+
+        // Look for the location bar/button to click
+        const locationBarSelectors = [
+            '.LocationBar__Container-sc-x8ezho-6',
+            '.LocationBar__SubtitleContainer-sc-x8ezho-9',
+            'div:has-text("Delivery in")',
+            '[class*="LocationBar"]'
+        ];
+
+        let locationButtonClicked = false;
+        for (const selector of locationBarSelectors) {
             try {
-              return window.grofers?.PRELOADED_STATE?.data || null;
-            } catch (e) {
-              return null;
-            }
-          });
-
-          if (preloaded) {
-            const candidates = [];
-            if (preloaded.search && Array.isArray(preloaded.search.results)) {
-              candidates.push(...preloaded.search.results);
-            }
-            if (preloaded.plp && Array.isArray(preloaded.plp.products)) {
-              candidates.push(...preloaded.plp.products);
-            }
-            if (preloaded.widgetizedLayout && Array.isArray(preloaded.widgetizedLayout.data)) {
-              preloaded.widgetizedLayout.data.forEach(w => {
-                if (w?.data && Array.isArray(w.data.items)) {
-                  w.data.items.forEach(it => candidates.push(it.data || it));
+                const locationBar = page.locator(selector).first();
+                const count = await locationBar.count();
+                if (count > 0) {
+                    log.info(`✓ Found location bar with selector: ${selector}`);
+                    await locationBar.click();
+                    locationButtonClicked = true;
+                    log.info('✓ Clicked location bar');
+                    await page.waitForTimeout(2000);
+                    break;
                 }
-              });
+            } catch (e) {
+                log.debug(`Location bar selector ${selector} not found`);
             }
-
-            if (candidates.length > 0) {
-              const parsed = candidates.map((c, i) => {
-                const title = c.title?.text || c.name || c.product_name || c.data?.title || c.data?.name || null;
-                const image = c.image?.url || c.product_image || c.image_url || c.data?.image_url || null;
-                const price = c.price || c.currentPrice || c.current_price || c.pricing?.price || null;
-                const pid = c.id || c.productId || c.product_id || c.sku || null;
-
-                return {
-                  productId: pid || `state-${i}`,
-                  productName: typeof title === 'string' ? title : title?.text || null,
-                  productImage: image,
-                  deliveryTime: globalDeliveryTime,
-                  currentPrice: typeof price === 'number' ? price : price?.value || null
-                };
-              }).filter(p => p.productName || p.currentPrice || p.productImage);
-
-              if (parsed.length > 0) {
-                log.info(`✅ Extracted ${parsed.length} products from preloaded state`);
-                return parsed;
-              }
-            }
-          }
-        } catch (e) {
-          log.warning(`Could not read PRELOADED_STATE: ${e.message}`);
         }
 
-        // DOM extraction
-        const products = await page.evaluate((globalDeliveryTime) => {
-          const results = [];
-          const productCards = Array.from(document.querySelectorAll('div[id][role="button"].tw-relative.tw-flex.tw-h-full.tw-flex-col'));
+        if (!locationButtonClicked) {
+            log.warning('⚠️ Could not find location bar, trying to proceed without changing location');
+            return false;
+        }
 
-          productCards.forEach((card) => {
+        // Wait for the location modal to appear
+        const modalSelectors = [
+            '.LocationSelectorDesktopV1__DetectLocationContainer-sc-19zschz-2',
+            '.location-show-addresses-v1',
+            'div:has-text("Change Location")',
+            'input[placeholder*="location"]',
+            'input[name="select-locality"]'
+        ];
+
+        let modalFound = false;
+        for (const selector of modalSelectors) {
             try {
-              const productId = card.id || null;
-
-              const nameEl = card.querySelector('div.tw-text-300.tw-font-semibold.tw-line-clamp-2');
-              const productName = nameEl ? nameEl.textContent.trim() : null;
-
-              const imgEl = card.querySelector('img');
-              const productImage = imgEl ? (imgEl.src || imgEl.getAttribute('src')) : null;
-
-              const priceEl = card.querySelector('div.tw-text-200.tw-font-semibold');
-              let currentPrice = null;
-              if (priceEl) {
-                const priceText = priceEl.textContent.trim();
-                const priceMatch = priceText.match(/₹\s*(\d+(?:,\d+)*(?:\.\d+)?)/);
-                if (priceMatch) {
-                  currentPrice = parseFloat(priceMatch[1].replace(/,/g, ''));
-                }
-              }
-
-              const originalPriceEl = card.querySelector('div.tw-text-200.tw-font-regular.tw-line-through');
-              let originalPrice = null;
-              if (originalPriceEl) {
-                const origText = originalPriceEl.textContent.trim();
-                const origMatch = origText.match(/₹\s*(\d+(?:,\d+)*(?:\.\d+)?)/);
-                if (origMatch) {
-                  originalPrice = parseFloat(origMatch[1].replace(/,/g, ''));
-                }
-              }
-
-              const weightEl = card.querySelector('div.tw-text-200.tw-font-medium.tw-line-clamp-1');
-              const productWeight = weightEl ? weightEl.textContent.trim() : null;
-
-              const deliveryEl = card.querySelector('div.tw-text-050.tw-font-bold.tw-uppercase');
-              const deliveryTime = globalDeliveryTime || (deliveryEl ? deliveryEl.textContent.trim() : null);
-
-              const outOfStockEl = card.querySelector('div.tw-absolute.tw-bottom-1\\/2.tw-right-1\\/2');
-              const isOutOfStock = outOfStockEl && outOfStockEl.textContent.includes('Out of Stock');
-
-              let discountPercentage = null;
-              if (currentPrice && originalPrice && originalPrice > currentPrice) {
-                discountPercentage = Math.round(((originalPrice - currentPrice) / originalPrice) * 100);
-              }
-
-              if (productName || currentPrice || productImage) {
-                results.push({
-                  productId: productId || `blinkit-${results.length}`,
-                  productName,
-                  productImage,
-                  currentPrice,
-                  originalPrice,
-                  discountPercentage,
-                  productWeight,
-                  deliveryTime,
-                  isOutOfStock: isOutOfStock || false,
-                  scrapedAt: new Date().toISOString()
-                });
-              }
-            } catch (err) {
-              console.error('Error processing product card:', err);
+                await page.waitForSelector(selector, { timeout: 5000 });
+                log.info(`✓ Location modal opened (found: ${selector})`);
+                modalFound = true;
+                break;
+            } catch (e) {
+                log.debug(`Modal selector ${selector} not found`);
             }
-          });
+        }
 
-          return results;
-        }, globalDeliveryTime);
+        if (!modalFound) {
+            log.warning('⚠️ Location modal did not open');
+            return false;
+        }
 
-        log.info(`✅ Extracted ${products.length} products from DOM`);
+        // Find and fill the pincode input field
+        const inputSelectors = [
+            'input[name="select-locality"]',
+            'input[placeholder*="location"]',
+            'input[placeholder*="search"]',
+            '.LocationSearchBox__InputSelect-sc-1k8u6a6-0'
+        ];
 
+        let inputFilled = false;
+        for (const selector of inputSelectors) {
+            try {
+                const input = page.locator(selector).first();
+                const count = await input.count();
+                if (count > 0) {
+                    log.info(`✓ Found pincode input with selector: ${selector}`);
+
+                    // Clear existing value
+                    await input.click();
+                    await page.waitForTimeout(500);
+                    await input.fill('');
+                    await page.waitForTimeout(500);
+
+                    // Type the pincode
+                    await input.fill(pincode);
+                    await page.waitForTimeout(1000);
+
+                    log.info(`✓ Entered pincode: ${pincode}`);
+                    inputFilled = true;
+                    break;
+                }
+            } catch (e) {
+                log.debug(`Input selector ${selector} not found: ${e.message}`);
+            }
+        }
+
+        if (!inputFilled) {
+            log.warning('⚠️ Could not fill pincode input');
+            return false;
+        }
+
+        // Wait for location suggestions to appear
+        await page.waitForTimeout(2000);
+
+        // Click on the first location suggestion
+        const locationListSelectors = [
+            '.LocationSearchList__LocationListContainer-sc-93rfr7-0',
+            '.address-container-v1 > div:first-child',
+            'div[class*="LocationList"]',
+            '.location-addresses-v1 > div > div:first-child'
+        ];
+
+        let locationSelected = false;
+        for (const selector of locationListSelectors) {
+            try {
+                const locationItems = page.locator(selector);
+                const count = await locationItems.count();
+
+                if (count > 0) {
+                    log.info(`✓ Found ${count} location suggestions with selector: ${selector}`);
+
+                    // Click the first matching location
+                    await locationItems.first().click();
+                    log.info('✓ Selected first location from suggestions');
+                    locationSelected = true;
+                    await page.waitForTimeout(3000);
+                    break;
+                }
+            } catch (e) {
+                log.debug(`Location list selector ${selector} not found: ${e.message}`);
+            }
+        }
+
+        if (!locationSelected) {
+            log.warning('⚠️ Could not select location from suggestions, trying to continue anyway');
+
+            // Try pressing Enter to confirm
+            try {
+                await page.keyboard.press('Enter');
+                await page.waitForTimeout(2000);
+                log.info('✓ Pressed Enter to confirm location');
+            } catch (e) {
+                log.warning('Could not press Enter');
+            }
+        }
+
+        // Verify location was set by checking if modal closed
+        await page.waitForTimeout(2000);
+
+        log.info(`✅ Location set successfully to pincode: ${pincode}`);
+        return true;
+
+    } catch (error) {
+        log.error(`❌ Error setting location: ${error.message}`);
+        log.warning('⚠️ Continuing without location change - results may be for default location');
+
+        // Try to close modal if it's still open
+        try {
+            const closeButton = page.locator('button:has(span.icon-cross)').first();
+            const count = await closeButton.count();
+            if (count > 0) {
+                await closeButton.click();
+                log.info('✓ Closed location modal');
+            }
+        } catch (e) {
+            // Ignore
+        }
+
+        return false;
+    }
+}
+
+// ENHANCED: Extract products with ALL available information
+async function extractSearchProducts(page, log) {
+    try {
+        log.info('🔍 Starting ENHANCED product extraction from search results...');
+
+        const products = await page.evaluate(() => {
+            const productCards = [];
+
+            // Helper function to convert product name to URL slug
+            function createSlug(name) {
+                if (!name) return 'product';
+                return name
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, '-')
+                    .replace(/^-+|-+$/g, '');
+            }
+
+            // Find all product cards
+            const productItems = document.querySelectorAll('div[id][role="button"][tabindex="0"].tw-relative.tw-flex.tw-h-full.tw-flex-col');
+            console.log(`Found ${productItems.length} product cards with ID attribute`);
+
+            productItems.forEach((item, index) => {
+                try {
+                    // Extract product ID from the div id attribute
+                    const productId = item.id;
+
+                    // Get all text content for searching
+                    const allText = item.innerText || item.textContent;
+
+                    // Check if product is out of stock FIRST (before other extractions)
+                    // Using text content check instead of :has-text() which doesn't work in querySelector
+                    const isOutOfStock = !!(
+                        allText.includes('Out of Stock') ||
+                        item.querySelector('div.tw-absolute.tw-bg-grey-500') ||
+                        item.querySelector('img.tw-opacity-\\[0\\.6\\]') ||
+                        item.querySelector('div.tw-opacity-\\[0\\.6\\] img') ||
+                        // Check for the "Out of Stock" overlay badge
+                        Array.from(item.querySelectorAll('div.tw-absolute')).some(el =>
+                            (el.textContent || '').includes('Out of Stock')
+                        )
+                    );
+
+                    // Extract product name - handle out of stock greyed out text
+                    const titleElement = item.querySelector('div.tw-text-300.tw-font-semibold.tw-line-clamp-2');
+                    const productName = titleElement ? titleElement.textContent.trim() : null;
+
+                    // Extract product image (high resolution) - works for both in-stock and out-of-stock
+                    // Try multiple strategies to find the image
+                    let productImage = null;
+
+                    // Strategy 1: Look for cdn.grofers.com images (most common)
+                    const imgElement = item.querySelector('img[src*="cdn.grofers.com"]');
+                    if (imgElement) {
+                        productImage = imgElement.src || imgElement.getAttribute('src');
+                    }
+
+                    // Strategy 2: If not found, try any img tag in the product card
+                    if (!productImage) {
+                        const anyImg = item.querySelector('img');
+                        if (anyImg) {
+                            productImage = anyImg.src || anyImg.getAttribute('src');
+                        }
+                    }
+
+                    // Strategy 3: Check for lazy-loaded images with data-src attribute
+                    if (!productImage) {
+                        const lazyImg = item.querySelector('img[data-src]');
+                        if (lazyImg) {
+                            productImage = lazyImg.getAttribute('data-src') || lazyImg.src;
+                        }
+                    }
+
+                    // Strategy 4: Look for background images in div elements
+                    if (!productImage) {
+                        const bgImgDiv = item.querySelector('div[style*="background-image"]');
+                        if (bgImgDiv) {
+                            const style = bgImgDiv.getAttribute('style');
+                            const urlMatch = style.match(/url\(['"]?(.*?)['"]?\)/);
+                            if (urlMatch && urlMatch[1]) {
+                                productImage = urlMatch[1];
+                            }
+                        }
+                    }
+
+                    // Strategy 5: Look in the image container specifically
+                    if (!productImage) {
+                        const imgContainer = item.querySelector('div.tw-relative.tw-w-full.tw-overflow-hidden img');
+                        if (imgContainer) {
+                            productImage = imgContainer.src || imgContainer.getAttribute('src') || imgContainer.getAttribute('data-src');
+                        }
+                    }
+
+                    // Strategy 6: Check for srcset attribute
+                    if (!productImage) {
+                        const imgWithSrcset = item.querySelector('img[srcset]');
+                        if (imgWithSrcset) {
+                            const srcset = imgWithSrcset.getAttribute('srcset');
+                            // Extract first URL from srcset
+                            if (srcset) {
+                                const firstUrl = srcset.split(',')[0].trim().split(' ')[0];
+                                productImage = firstUrl;
+                            }
+                        }
+                    }
+
+                    // Upgrade to higher resolution if we found an image
+                    if (productImage) {
+                        // Convert to full URL if it's relative
+                        if (productImage.startsWith('//')) {
+                            productImage = 'https:' + productImage;
+                        } else if (productImage.startsWith('/')) {
+                            productImage = 'https://blinkit.com' + productImage;
+                        }
+
+                        // Try to get higher resolution image
+                        if (productImage.includes('w=270')) {
+                            productImage = productImage.replace('w=270', 'w=540');
+                        } else if (productImage.includes('w=135')) {
+                            productImage = productImage.replace('w=135', 'w=540');
+                        }
+                    }
+
+                    // Extract weight/quantity - works for both in-stock and out-of-stock
+                    const weightElement = item.querySelector('div.tw-flex.tw-items-center div.tw-text-200.tw-font-medium.tw-line-clamp-1');
+                    const productWeight = weightElement ? weightElement.textContent.trim() : null;
+
+                    // Extract prices (current and original) - handle greyed out prices for out-of-stock
+                    const priceElements = item.querySelectorAll('div.tw-text-200.tw-font-semibold, div.tw-text-grey-600.tw-text-200.tw-font-semibold');
+                    let currentPrice = null;
+                    let originalPrice = null;
+
+                    priceElements.forEach(priceEl => {
+                        const priceText = priceEl.textContent.trim();
+                        if (priceText.includes('₹') && !priceEl.classList.contains('tw-line-through')) {
+                            const priceMatch = priceText.match(/₹\s*(\d+(?:,\d+)*(?:\.\d+)?)/);
+                            if (priceMatch && !currentPrice) {
+                                currentPrice = parseFloat(priceMatch[1].replace(/,/g, ''));
+                            }
+                        }
+                    });
+
+                    // Extract original/strikethrough price
+                    const originalPriceElement = item.querySelector('div.tw-text-200.tw-font-regular.tw-line-through');
+                    if (originalPriceElement) {
+                        const originalPriceText = originalPriceElement.textContent.trim();
+                        const originalPriceMatch = originalPriceText.match(/₹\s*(\d+(?:,\d+)*(?:\.\d+)?)/);
+                        if (originalPriceMatch) {
+                            originalPrice = parseFloat(originalPriceMatch[1].replace(/,/g, ''));
+                        }
+                    }
+
+                    // Extract discount percentage
+                    let discountPercentage = null;
+
+                    // Look for discount badge text (e.g., "10% OFF")
+                    const discountMatch = allText.match(/(\d+)%\s*OFF/i);
+                    if (discountMatch) {
+                        discountPercentage = parseInt(discountMatch[1]);
+                    }
+
+                    // If no discount badge but we have original price, calculate it
+                    if (!discountPercentage && currentPrice && originalPrice && originalPrice > currentPrice) {
+                        discountPercentage = Math.round(((originalPrice - currentPrice) / originalPrice) * 100);
+                    }
+
+                    // Extract delivery time
+                    let deliveryTime = null;
+                    const deliveryElement = item.querySelector('div.tw-text-050.tw-font-bold.tw-uppercase');
+                    if (deliveryElement) {
+                        deliveryTime = deliveryElement.textContent.trim();
+                    } else {
+                        const deliveryMatch = allText.match(/(\d+\s*MINS?)/i);
+                        if (deliveryMatch) {
+                            deliveryTime = deliveryMatch[1];
+                        }
+                    }
+
+                    // Extract rating if available
+                    let rating = null;
+                    const ratingElement = item.querySelector('[class*="rating"], [class*="star"]');
+                    if (ratingElement) {
+                        const ratingText = ratingElement.textContent.trim();
+                        const ratingMatch = ratingText.match(/(\d+(?:\.\d+)?)/);
+                        if (ratingMatch) {
+                            rating = parseFloat(ratingMatch[1]);
+                        }
+                    }
+
+                    // Extract product highlights/features (green text with checkmark icon)
+                    let highlights = [];
+                    const highlightElements = item.querySelectorAll('div.tw-text-base-green, div.tw-text-green-700');
+                    highlightElements.forEach(el => {
+                        const text = el.textContent.trim();
+                        if (text && text.length > 0 && !text.includes('₹') && !text.includes('MINS')) {
+                            highlights.push(text);
+                        }
+                    });
+
+                    // Extract badge/tag information (like "Best Seller", "New", etc.)
+                    let badges = [];
+                    const badgeElements = item.querySelectorAll('div[class*="badge"], div[class*="tag"]');
+                    badgeElements.forEach(badge => {
+                        const badgeText = badge.textContent.trim();
+                        if (badgeText && badgeText.length > 0 && !badges.includes(badgeText)) {
+                            badges.push(badgeText);
+                        }
+                    });
+
+                    // Construct product URL
+                    let productUrl = null;
+                    const linkElement = item.querySelector('a[href*="/prn/"]');
+                    if (linkElement) {
+                        productUrl = linkElement.href;
+                    } else if (productId && productName) {
+                        // Construct URL: https://blinkit.com/prn/{product-slug}/prid/{productId}
+                        const slug = createSlug(productName);
+                        productUrl = `https://blinkit.com/prn/${slug}/prid/${productId}`;
+                    }
+
+                    // Extract availability/stock status message
+                    let stockMessage = null;
+                    if (isOutOfStock) {
+                        stockMessage = "Out of Stock";
+                    } else {
+                        const addButton = item.querySelector('div[role="button"]:has-text("ADD")');
+                        if (addButton) {
+                            stockMessage = "In Stock";
+                        }
+                    }
+
+                    // Extract options/variants if available (e.g., "2 options")
+                    let hasVariants = false;
+                    let variantCount = null;
+                    const variantElement = item.querySelector('div.tw-text-050:has-text("option")');
+                    if (variantElement) {
+                        hasVariants = true;
+                        const variantMatch = variantElement.textContent.match(/(\d+)\s*option/i);
+                        if (variantMatch) {
+                            variantCount = parseInt(variantMatch[1]);
+                        }
+                    }
+
+                    // Extract all raw text for additional context
+                    const rawText = allText.replace(/\s+/g, ' ').trim();
+
+                    // Calculate savings if we have both prices
+                    let savings = null;
+                    if (currentPrice && originalPrice && originalPrice > currentPrice) {
+                        savings = originalPrice - currentPrice;
+                    }
+
+                    // IMPORTANT: Include ALL products - both in stock and out of stock
+                    // Only skip if we have NO useful data at all
+                    if (productName || currentPrice || productImage || productId) {
+                        const product = {
+                            // Core identification
+                            productId: productId || `product-${index}`,
+                            productName,
+                            productUrl,
+
+                            // Visual
+                            productImage,
+
+                            // Pricing
+                            currentPrice,
+                            originalPrice,
+                            discountPercentage,
+                            savings,
+
+                            // Product details
+                            productWeight,
+
+                            // Availability - THIS IS KEY!
+                            isOutOfStock,
+                            stockMessage,
+                            deliveryTime,
+
+                            // Additional info
+                            rating,
+                            highlights: highlights.length > 0 ? highlights : null,
+                            badges: badges.length > 0 ? badges : null,
+                            hasVariants,
+                            variantCount,
+
+                            // Metadata
+                            rawText,
+                            scrapedAt: new Date().toISOString()
+                        };
+
+                        productCards.push(product);
+
+                        // Log extraction for debugging
+                        if (index < 3) {
+                            console.log(`Product ${index + 1}: ${productName} - ${isOutOfStock ? '🔴 OUT OF STOCK' : '🟢 IN STOCK'}`);
+                        }
+                    }
+                } catch (err) {
+                    console.error(`Error processing product ${index}:`, err);
+                }
+            });
+
+            // Fallback method if primary extraction fails
+            if (productCards.length === 0) {
+                console.log('Primary extraction found 0 products, trying fallback...');
+
+                const alternativeItems = document.querySelectorAll('div[role="button"][tabindex="0"]');
+                console.log(`Found ${alternativeItems.length} alternative product containers`);
+
+                alternativeItems.forEach((item, index) => {
+                    try {
+                        const hasTitle = item.querySelector('div.tw-text-300.tw-font-semibold.tw-line-clamp-2');
+                        const hasPrice = item.querySelector('div.tw-text-200.tw-font-semibold');
+                        const allText = item.innerText || item.textContent;
+
+                        // Check for out of stock in fallback too
+                        const isOutOfStock = allText.includes('Out of Stock');
+
+                        // Include products even if they don't have ADD button (out of stock won't have it)
+                        if (hasTitle) {
+                            const productName = hasTitle.textContent.trim();
+
+                            let currentPrice = null;
+                            if (hasPrice) {
+                                const priceText = hasPrice.textContent.trim();
+                                const priceMatch = priceText.match(/₹\s*(\d+(?:,\d+)*(?:\.\d+)?)/);
+                                currentPrice = priceMatch ? parseFloat(priceMatch[1].replace(/,/g, '')) : null;
+                            }
+
+                            // Enhanced image extraction for fallback
+                            let productImage = null;
+
+                            // Try multiple strategies
+                            const img1 = item.querySelector('img[src*="cdn.grofers.com"]');
+                            const img2 = item.querySelector('img');
+                            const img3 = item.querySelector('img[data-src]');
+
+                            if (img1) {
+                                productImage = img1.src || img1.getAttribute('src');
+                            } else if (img2) {
+                                productImage = img2.src || img2.getAttribute('src') || img2.getAttribute('data-src');
+                            } else if (img3) {
+                                productImage = img3.getAttribute('data-src');
+                            }
+
+                            // Check for srcset
+                            if (!productImage) {
+                                const imgWithSrcset = item.querySelector('img[srcset]');
+                                if (imgWithSrcset) {
+                                    const srcset = imgWithSrcset.getAttribute('srcset');
+                                    if (srcset) {
+                                        productImage = srcset.split(',')[0].trim().split(' ')[0];
+                                    }
+                                }
+                            }
+
+                            // Normalize URL
+                            if (productImage) {
+                                if (productImage.startsWith('//')) {
+                                    productImage = 'https:' + productImage;
+                                } else if (productImage.startsWith('/')) {
+                                    productImage = 'https://blinkit.com' + productImage;
+                                }
+
+                                // Upgrade resolution
+                                if (productImage.includes('w=270')) {
+                                    productImage = productImage.replace('w=270', 'w=540');
+                                } else if (productImage.includes('w=135')) {
+                                    productImage = productImage.replace('w=135', 'w=540');
+                                }
+                            }
+
+                            const weightEl = item.querySelector('div.tw-text-200.tw-font-medium.tw-line-clamp-1');
+                            const productWeight = weightEl ? weightEl.textContent.trim() : null;
+
+                            const productId = item.id || `fallback-${index}`;
+                            const slug = createSlug(productName);
+
+                            productCards.push({
+                                productId,
+                                productName,
+                                productUrl: `https://blinkit.com/prn/${slug}/prid/${productId}`,
+                                productImage,
+                                currentPrice,
+                                productWeight,
+                                isOutOfStock,
+                                stockMessage: isOutOfStock ? "Out of Stock" : "In Stock",
+                                scrapedAt: new Date().toISOString()
+                            });
+
+                            console.log(`Fallback extracted: ${productName} - ${isOutOfStock ? '🔴 OUT OF STOCK' : '🟢 IN STOCK'} - Image: ${productImage ? '✅' : '❌'}`);
+                        }
+                    } catch (err) {
+                        console.error('Error in fallback extraction:', err);
+                    }
+                });
+            }
+
+            return productCards;
+        });
+
+        log.info(`✅ Extracted ${products.length} products with complete data from search results`);
+
+        // Count in-stock vs out-of-stock
+        const inStockCount = products.filter(p => !p.isOutOfStock).length;
+        const outOfStockCount = products.filter(p => p.isOutOfStock).length;
+        const withImages = products.filter(p => p.productImage).length;
+        const withoutImages = products.filter(p => !p.productImage).length;
+
+        log.info(`   🟢 In Stock: ${inStockCount}`);
+        log.info(`   🔴 Out of Stock: ${outOfStockCount}`);
+        log.info(`   🖼️  With Images: ${withImages}`);
+        log.info(`   ❌ Missing Images: ${withoutImages}`);
+
+        // Log products without images for debugging
+        if (withoutImages > 0 && debugMode) {
+            console.log('⚠️ Products missing images:');
+            products.filter(p => !p.productImage).slice(0, 5).forEach(p => {
+                console.log(`   - ${p.productName || p.productId}`);
+            });
+        }
+
+        // Log detailed sample product for debugging
         if (products.length > 0 && debugMode) {
-          console.log('Sample product:', JSON.stringify(products[0], null, 2));
+            console.log('=== SAMPLE PRODUCT (Full Data) ===');
+            console.log(JSON.stringify(products[0], null, 2));
+            console.log('================================');
+
+            // Show an out-of-stock example if available
+            const outOfStockExample = products.find(p => p.isOutOfStock);
+            if (outOfStockExample) {
+                console.log('=== SAMPLE OUT-OF-STOCK PRODUCT ===');
+                console.log(JSON.stringify(outOfStockExample, null, 2));
+                console.log('===================================');
+            }
         }
 
         return products;
-      } catch (error) {
-        log.error(`Error extracting products: ${error.message}`);
+    } catch (error) {
+        log.error(`Error extracting search products: ${error.message}`);
+        log.error(`Stack: ${error.stack}`);
         return [];
-      }
     }
+}
 
-    // Initialize crawler
-    const crawler = new PlaywrightCrawler({
-      proxyConfiguration: proxyConfig,
-      maxRequestRetries,
-      maxConcurrency,
-      navigationTimeoutSecs: navigationTimeout / 1000,
-      headless,
-      launchContext: {
+// Initialize the crawler
+const crawler = new PlaywrightCrawler({
+    proxyConfiguration: proxyConfig,
+    maxRequestRetries,
+    navigationTimeoutSecs: navigationTimeout / 1000,
+    requestHandlerTimeoutSecs: 300, // Increased timeout to 5 minutes to allow for long scrolling
+    headless,
+
+    launchContext: {
         launchOptions: {
-          args: [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-dev-shm-usage',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-gpu'
-          ],
-          ...((!proxyConfig && launchProxy) ? { proxy: launchProxy } : {})
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-web-security'
+            ]
         }
-      },
-      preNavigationHooks: [
-        async ({ page, log }) => {
-          try {
-            const ua = pickRandom(USER_AGENTS);
-            await page.setExtraHTTPHeaders({
-              'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-              'User-Agent': ua
+    },
+
+    preNavigationHooks: [
+        async ({ page }) => {
+            await page.context().setGeolocation({
+                latitude: 18.5204,
+                longitude: 73.8567
             });
+
+            await page.setExtraHTTPHeaders({
+                'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            });
+
             await page.setViewportSize({ width: 1920, height: 1080 });
-            await page.addInitScript((ua) => {
-              Object.defineProperty(navigator, 'webdriver', { get: () => false });
-              Object.defineProperty(navigator, 'userAgent', { get: () => ua });
-            }, ua).catch(() => {});
-          } catch (e) {
-            log.error(`preNavigationHook error: ${e.message}`);
-          }
+
+            // Forward page console messages for debugging
+            page.on('console', msg => {
+                try {
+                    const text = msg.text();
+                    const type = msg.type();
+                    console.log(`[page:${type}] ${text}`);
+                } catch (e) {
+                    // ignore
+                }
+            });
         }
-      ],
-      async requestHandler({ page, request, log }) {
+    ],
+
+    async requestHandler({ page, request, log }) {
+        const { url } = request;
+
+        log.info(`🔍 Processing search URL: ${url}`);
+
         try {
-          const { url } = request;
-          const { userData = {} } = request;
-          const { isFirstRequest = false } = userData;
+            // Wait for page to load
+            await page.waitForLoadState('domcontentloaded');
+            await page.waitForTimeout(5000);
 
-          log.info(`🔍 Processing: ${url}`);
-
-          await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
-          await page.waitForTimeout(3000);
-
-          if ((pincode || deliveryLocation) && isFirstRequest) {
-            await setDeliveryLocation(page, log, deliveryLocation, pincode);
-            await page.waitForTimeout(2000);
-          }
-
-          if (debugMode) {
-            await debugPageState(page, log, 'search-initial').catch(() => {});
-          }
-
-          // Close popups
-          try {
-            const closeButtons = page.locator('button:has-text("Close"), button:has-text("×"), [aria-label="Close"]');
-            if (await closeButtons.count() > 0) {
-              await closeButtons.first().click({ timeout: 2000 });
-              await page.waitForTimeout(800);
+            if (debugMode) {
+                log.info('📸 Taking initial debug snapshot...');
+                await debugPageState(page, log, 'search-initial');
             }
-          } catch (e) {
-            // No popup
-          }
 
-          const resultsFound = await waitForSearchResults(page, log);
-          if (!resultsFound) {
-            log.warning('⚠️ No search results detected');
-            await debugPageState(page, log, 'no-results');
-            return;
-          }
+            // STEP 1: Handle Location Selection
+            await setLocation(page, log, input.pincode || '411001');
 
-          // Scroll the product container
-          await autoScroll(page, log, maxProductsPerSearch);
-
-          // Extract global delivery time
-          let globalDeliveryTime = null;
-          try {
-            const deliveryTimeEl = page.locator('div[class*="LocationBar__Title"]');
-            if (await deliveryTimeEl.count() > 0) {
-              globalDeliveryTime = await deliveryTimeEl.first().textContent();
-              log.info(`✓ Found global delivery time: ${globalDeliveryTime}`);
+            // STEP 2: Close any remaining popups
+            try {
+                const closeButtons = page.locator('button:has-text("Close"), button:has-text("×"), [aria-label="Close"]');
+                const count = await closeButtons.count();
+                if (count > 0) {
+                    await closeButtons.first().click();
+                    log.info('✓ Closed popup');
+                    await page.waitForTimeout(1000);
+                }
+            } catch (e) {
+                // No popup
             }
-          } catch (e) {
-            log.warning(`Could not extract global delivery time: ${e.message}`);
-          }
 
-          const products = await extractSearchProducts(page, log, globalDeliveryTime);
+            // Wait for search results
+            const resultsFound = await waitForSearchResults(page, log);
 
-          if (products.length === 0) {
-            log.warning('⚠️ No products extracted');
-            await debugPageState(page, log, 'no-products');
-            return;
-          }
+            if (!resultsFound) {
+                log.warning('⚠️ No search results detected');
+                if (debugMode) {
+                    await debugPageState(page, log, 'no-results');
+                }
+            }
 
-          const urlParams = new URL(url).searchParams;
-          const searchQuery = urlParams.get('q');
+            // Scroll to load more products
+            const isSearchQuery = url.includes('/s/?q=');
+            // If it's a direct URL (not a search query), try to scroll the container
+            const scrollSelector = isSearchQuery ? null : '#plpContainer';
 
-          let currentLocation = deliveryLocation || pincode || 'Unknown';
-          try {
-            const locationText = await page.locator('div[class*="LocationBar__Subtitle"]').first().textContent({ timeout: 2000 });
-            currentLocation = locationText.trim();
-          } catch (e) {
-            // Use fallback
-          }
+            await autoScroll(page, log, scrollCount, scrollSelector);
 
-          const productsToSave = products.slice(0, maxProductsPerSearch).map(product => ({
-            ...product,
-            searchQuery,
-            requestedPincode: pincode,
-            deliveryLocation: currentLocation,
-            platform: 'Blinkit'
-          }));
+            if (debugMode) {
+                await debugPageState(page, log, 'after-scroll');
+            }
 
-          await Dataset.pushData(productsToSave);
-          log.info(`✅ Saved ${productsToSave.length} products for "${searchQuery}"`);
+            // Extract products with ALL information
+            const products = await extractSearchProducts(page, log);
+
+            if (products.length === 0) {
+                log.error('❌ No products extracted! Check debug screenshots.');
+                return;
+            }
+
+            // Extract search query from URL
+            let searchQuery = null;
+            const urlParams = new URL(url).searchParams;
+            searchQuery = urlParams.get('q');
+
+            // Add search metadata and platform info to each product
+            let savedCount = 0;
+            for (const product of products.slice(0, maxProductsPerSearch)) {
+                product.searchQuery = searchQuery;
+                product.searchUrl = url;
+                product.platform = 'Blinkit';
+                product.requestedPincode = input.pincode || '411001';
+
+                await Dataset.pushData(product);
+                savedCount++;
+
+                const stockStatus = product.isOutOfStock ? '🔴 OUT OF STOCK' : '🟢 IN STOCK';
+                const priceInfo = product.originalPrice
+                    ? `₹${product.currentPrice} (was ₹${product.originalPrice}, ${product.discountPercentage}% off)`
+                    : `₹${product.currentPrice}`;
+
+                log.info(`💾 [${savedCount}/${Math.min(products.length, maxProductsPerSearch)}] ${stockStatus} ${product.productName || product.productId} - ${priceInfo}`);
+            }
+
+            // Summary statistics
+            const inStock = products.filter(p => !p.isOutOfStock).length;
+            const outOfStock = products.filter(p => p.isOutOfStock).length;
+            const withDiscount = products.filter(p => p.discountPercentage).length;
+            const avgPrice = products.filter(p => p.currentPrice).reduce((sum, p) => sum + p.currentPrice, 0) / products.filter(p => p.currentPrice).length;
+
+            log.info(`
+✅ SCRAPING COMPLETED!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Summary for query: "${searchQuery}"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📦 Total Products: ${savedCount}
+🟢 In Stock: ${inStock}
+🔴 Out of Stock: ${outOfStock}
+🏷️  With Discount: ${withDiscount}
+💰 Avg Price: ₹${avgPrice.toFixed(2)}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            `);
 
         } catch (error) {
-          log.error(`❌ Error: ${error.message}`);
-          if (screenshotOnError) {
-            try {
-              const screenshot = await page.screenshot({ fullPage: false });
-              await Actor.setValue(`error-${Date.now()}.png`, screenshot, { contentType: 'image/png' });
-            } catch (e) {
-              // Ignore
+            log.error(`❌ Error processing ${url}: ${error.message}`);
+            log.error(`Stack: ${error.stack}`);
+
+            if (screenshotOnError) {
+                try {
+                    const screenshot = await page.screenshot({ fullPage: true });
+                    await Actor.setValue(`error-screenshot-${Date.now()}.png`, screenshot, { contentType: 'image/png' });
+                    log.info('📸 Error screenshot saved');
+                } catch (e) {
+                    log.error(`Failed to capture screenshot: ${e.message}`);
+                }
             }
-          }
-          throw error;
+
+            throw error;
         }
-      },
-      failedRequestHandler: async ({ request, log }) => {
-        log.error(`❌ Request failed: ${request.url}`);
-        try {
-          const failedUrls = await Actor.getValue('FAILED_URLS') || [];
-          failedUrls.push({
+    },
+
+    failedRequestHandler: async ({ request, log }) => {
+        log.error(`❌ Request ${request.url} failed`);
+
+        const failedUrls = await Actor.getValue('FAILED_URLS') || [];
+        failedUrls.push({
             url: request.url,
             timestamp: new Date().toISOString()
-          });
-          await Actor.setValue('FAILED_URLS', failedUrls);
-        } catch (e) {
-          log.error(`Failed to save failed URL: ${e.message}`);
-        }
-      }
+        });
+        await Actor.setValue('FAILED_URLS', failedUrls);
+    }
+});
+
+// Start the crawler
+if (allSearchUrls.length > 0) {
+    console.log('\n🚀 Starting ENHANCED Blinkit Search Results Scraper');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`🔍 Search URLs: ${allSearchUrls.length}`);
+    console.log(`📍 Pincode: ${input.pincode || '411001'}`);
+    console.log(`📊 Max products per search: ${maxProductsPerSearch}`);
+    console.log(`📜 Scroll iterations: ${scrollCount}`);
+    console.log(`🐛 Debug mode: ${debugMode}`);
+    console.log(`👁️  Headless: ${headless}`);
+    console.log('\n📋 Extracting Fields:');
+    console.log('   • Product ID & Name');
+    console.log('   • Product URL (constructed)');
+    console.log('   • High-res Product Image');
+    console.log('   • Current & Original Price');
+    console.log('   • Discount Percentage & Savings');
+    console.log('   • Product Weight/Quantity');
+    console.log('   • Stock Status (In/Out of Stock)');
+    console.log('   • Delivery Time');
+    console.log('   • Rating');
+    console.log('   • Highlights & Badges');
+    console.log('   • Variants Info');
+    console.log('   • Raw Text Data');
+    console.log('\n🎯 Location Features:');
+    console.log('   • Automatic location selection');
+    console.log('   • Pincode-based delivery area');
+    console.log('   • Fallback to default if location fails');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+
+    allSearchUrls.forEach((url, idx) => {
+        console.log(`  ${idx + 1}. ${url}`);
     });
+    console.log('');
 
-    // Start crawler
-    if (allSearchUrls.length > 0) {
-      console.log('\n🚀 Starting Blinkit Scraper');
-      console.log(`🔍 URLs: ${allSearchUrls.length}`);
-      console.log(`📍 Location: ${deliveryLocation || pincode || 'Default'}`);
-      console.log(`📊 Max products: ${maxProductsPerSearch}\n`);
+    await crawler.run(allSearchUrls.map(url => ({ url })));
 
-      const requests = allSearchUrls.map((url, index) => ({
-        url,
-        userData: { isFirstRequest: index === 0 }
-      }));
+    console.log('\n✅ SCRAPING COMPLETED SUCCESSFULLY!');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('📁 Results: storage/datasets/default/');
+    console.log('📸 Screenshots: storage/key_value_stores/default/');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+} else {
+    console.log('❌ No search URLs or queries provided!');
+    console.log('Please provide either "searchUrls" or "searchQueries" in input.json\n');
+}
 
-      await crawler.run(requests);
-      console.log('\n✅ Scraping completed successfully!\n');
-    } else {
-      console.log('❌ No URLs provided!\n');
-    }
-
-    // Proper exit
-    await Actor.exit();
-  } catch (error) {
-    console.error('FATAL ERROR:', error);
-    try {
-      await Actor.setValue('FATAL_ERROR', error?.stack || String(error));
-      await Actor.exit(1);
-    } catch (e) {
-      process.exit(1);
-    }
-  }
-})();
+await Actor.exit();
