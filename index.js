@@ -529,7 +529,8 @@ async function extractSearchProducts(page, log) {
                     if (isOutOfStock) {
                         stockMessage = "Out of Stock";
                     } else {
-                        const addButton = item.querySelector('div[role="button"]:has-text("ADD")');
+                        const addButtons = Array.from(item.querySelectorAll('div[role="button"]'));
+                        const addButton = addButtons.find(el => (el.textContent || '').includes('ADD'));
                         if (addButton) {
                             stockMessage = "In Stock";
                         }
@@ -538,7 +539,9 @@ async function extractSearchProducts(page, log) {
                     // Extract options/variants if available (e.g., "2 options")
                     let hasVariants = false;
                     let variantCount = null;
-                    const variantElement = item.querySelector('div.tw-text-050:has-text("option")');
+                    const smallTexts = Array.from(item.querySelectorAll('div.tw-text-050'));
+                    const variantElement = smallTexts.find(el => (el.textContent || '').match(/\d+\s*option/i));
+
                     if (variantElement) {
                         hasVariants = true;
                         const variantMatch = variantElement.textContent.match(/(\d+)\s*option/i);
